@@ -388,8 +388,8 @@ app.get("/health", (req, res) => res.send("ok"));
 // ---------- App (PWA) files ----------
 app.get("/manifest.webmanifest", (req, res) => {
   res.type("application/manifest+json").json({
-    name: "ESP32 Monitor",
-    short_name: "ESP32",
+    name: "Weather Report Project",
+    short_name: "Weather Report",
     description: "Temperature and dust level from my ESP32",
     start_url: "/",
     scope: "/",
