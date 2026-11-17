@@ -6,7 +6,10 @@ app.use(express.json());
 // Secret key the ESP32 must send. Set API_KEY in Render > Environment.
 const API_KEY = process.env.API_KEY || "change-me";
 
-// How often a log entry is saved (hours). Optional: set LOG_EVERY_HOURS in Render to change.
+// Optional: if you set FORCE_PASSWORD in Render, the dashboard asks for it before a Force log.
+const FORCE_PASSWORD = process.env.FORCE_PASSWORD || "";
+
+// How often an automatic log entry is saved (hours). Optional: set LOG_EVERY_HOURS in Render to change.
 const LOG_EVERY_HOURS = Number(process.env.LOG_EVERY_HOURS) || 2;
 const SLOT_MS = LOG_EVERY_HOURS * 3600 * 1000;
 const BKK_OFFSET_MS = 7 * 3600 * 1000; // UTC+7 (Asia/Bangkok)
@@ -33,65 +36,39 @@ if (pool) {
   console.log("DATABASE_URL not set: logs are kept in memory only (lost on restart)");
 }
 
-const memLogs = []; // fallback when there is no database
-let dbReady = false;
+const memLogs = [];            // fallback when there is no database
+const memArchives = new Map(); // fallback monthly archives
 
-async function ensureDb() {
-  if (!pool || dbReady) return;
-  await pool.query(
-    "CREATE TABLE IF NOT EXISTS readings (" +
-      "id SERIAL PRIMARY KEY, " +
-      "slot BIGINT UNIQUE NOT NULL, " +
-      "ts TIMESTAMPTZ NOT NULL DEFAULT now(), " +
-      "temp REAL, dust REAL)"
-  );
-  dbReady = true;
-}
-
-// One log entry per time slot (2 hours, aligned to Bangkok time).
-// The UNIQUE slot column stops duplicates, even after a restart.
-let lastSlotTried = null;
-async function maybeLog(temp, dust) {
-  const slot = Math.floor((Date.now() + BKK_OFFSET_MS) / SLOT_MS);
-  if (slot === lastSlotTried) return;
-  lastSlotTried = slot;
-  try {
-    if (pool) {
-      await ensureDb();
+// Creates / upgrades the tables once. Safe to run on a database that already has the old table.
+let dbReadyPromise = null;
+function ensureDb() {
+  if (!pool) return Promise.resolve();
+  if (!dbReadyPromise) {
+    dbReadyPromise = (async () => {
       await pool.query(
-        "INSERT INTO readings (slot, temp, dust) VALUES ($1, $2, $3) ON CONFLICT (slot) DO NOTHING",
-        [slot, temp, dust]
+        "CREATE TABLE IF NOT EXISTS readings (" +
+          "id SERIAL PRIMARY KEY, " +
+          "slot BIGINT UNIQUE, " +
+          "ts TIMESTAMPTZ NOT NULL DEFAULT now(), " +
+          "temp REAL, dust REAL, " +
+          "kind TEXT NOT NULL DEFAULT 'auto')"
       );
-    } else if (!memLogs.some((r) => r.slot === slot)) {
-      memLogs.push({ slot, ts: new Date().toISOString(), temp, dust });
-      if (memLogs.length > 1000) memLogs.shift();
-    }
-    console.log("Logged slot " + slot + ": " + temp + " C, " + dust + " ug/m3");
-  } catch (e) {
-    console.error("Log failed:", e.message);
-    lastSlotTried = null; // try again on the next reading
+      // Upgrade an older table: add the type column, allow Force logs (they have no time slot)
+      await pool.query("ALTER TABLE readings ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'auto'");
+      await pool.query("ALTER TABLE readings ALTER COLUMN slot DROP NOT NULL");
+      await pool.query(
+        "CREATE TABLE IF NOT EXISTS archives (" +
+          "ym TEXT PRIMARY KEY, " +
+          "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), " +
+          "row_count INT NOT NULL, " +
+          "csv TEXT NOT NULL)"
+      );
+    })().catch((e) => {
+      dbReadyPromise = null; // try again next time
+      throw e;
+    });
   }
-}
-
-async function getLogs(hours) {
-  const since = hours ? new Date(Date.now() - hours * 3600 * 1000) : new Date(0);
-  if (pool) {
-    await ensureDb();
-    const r = await pool.query(
-      "SELECT ts, temp, dust FROM readings WHERE ts >= $1 ORDER BY ts ASC LIMIT 5000",
-      [since]
-    );
-    return r.rows.map((x) => ({ ts: new Date(x.ts).toISOString(), temp: x.temp, dust: x.dust }));
-  }
-  return memLogs
-    .filter((x) => new Date(x.ts) >= since)
-    .map((x) => ({ ts: x.ts, temp: x.temp, dust: x.dust }));
-}
-
-function parseHours(q, def) {
-  const h = Number(q);
-  if (q === undefined || q === "" || !Number.isFinite(h) || h < 0) return def;
-  return h; // 0 means all
+  return dbReadyPromise;
 }
 
 // ---------- Helpers ----------
@@ -114,6 +91,10 @@ function bangkokIso(d) {
   }).format(d);
 }
 
+function monthKey(d) {
+  return bangkokIso(d).slice(0, 7); // "2026-11" in Bangkok time
+}
+
 function dustLabel(ug) {
   if (ug < 35) return "Good";
   if (ug < 75) return "Moderate";
@@ -121,10 +102,183 @@ function dustLabel(ug) {
   return "Very high";
 }
 
+function parseHours(q, def) {
+  const h = Number(q);
+  if (q === undefined || q === "" || !Number.isFinite(h) || h < 0) return def;
+  return h; // 0 means all
+}
+
+function rowsToCsv(rows) {
+  const lines = ["time_utc+7,type,temp_c,dust_ugm3"].concat(
+    rows.map(
+      (r) =>
+        bangkokIso(new Date(r.ts)) + "," +
+        (r.kind === "force" ? "force" : "auto") + "," +
+        (r.temp === null ? "" : r.temp) + "," +
+        (r.dust === null ? "" : r.dust)
+    )
+  );
+  return lines.join("\n") + "\n";
+}
+
+// ---------- Saving and reading logs ----------
+// Automatic log: one entry per time slot (2 hours, aligned to Bangkok time).
+// The UNIQUE slot column stops duplicates, even after a restart.
+let lastSlotTried = null;
+async function maybeLog(temp, dust) {
+  const slot = Math.floor((Date.now() + BKK_OFFSET_MS) / SLOT_MS);
+  if (slot === lastSlotTried) return;
+  lastSlotTried = slot;
+  try {
+    if (pool) {
+      await ensureDb();
+      await pool.query(
+        "INSERT INTO readings (slot, temp, dust, kind) VALUES ($1, $2, $3, 'auto') ON CONFLICT (slot) DO NOTHING",
+        [slot, temp, dust]
+      );
+    } else if (!memLogs.some((r) => r.slot === slot)) {
+      memLogs.push({ slot, ts: new Date().toISOString(), temp, dust, kind: "auto" });
+      if (memLogs.length > 1000) memLogs.shift();
+    }
+    console.log("Logged (auto) slot " + slot + ": " + temp + " C, " + dust + " ug/m3");
+    archiveFinishedMonths(); // also catch up on monthly archives
+  } catch (e) {
+    console.error("Log failed:", e.message);
+    lastSlotTried = null; // try again on the next reading
+  }
+}
+
+// Force log: saved right now, whenever the button is pressed.
+async function addForceLog(temp, dust) {
+  const ts = new Date();
+  if (pool) {
+    await ensureDb();
+    await pool.query(
+      "INSERT INTO readings (slot, ts, temp, dust, kind) VALUES (NULL, $1, $2, $3, 'force')",
+      [ts, temp, dust]
+    );
+  } else {
+    memLogs.push({ slot: null, ts: ts.toISOString(), temp, dust, kind: "force" });
+    if (memLogs.length > 1000) memLogs.shift();
+  }
+  console.log("Logged (force): " + temp + " C, " + dust + " ug/m3");
+  return { ts: ts.toISOString(), temp, dust, kind: "force" };
+}
+
+async function getLogs(hours, limit) {
+  const since = hours ? new Date(Date.now() - hours * 3600 * 1000) : new Date(0);
+  if (pool) {
+    await ensureDb();
+    const r = await pool.query(
+      "SELECT ts, temp, dust, kind FROM (" +
+        "SELECT ts, temp, dust, kind FROM readings WHERE ts >= $1 ORDER BY ts DESC LIMIT $2" +
+      ") t ORDER BY ts ASC",
+      [since, limit]
+    );
+    return r.rows.map((x) => ({ ts: new Date(x.ts).toISOString(), temp: x.temp, dust: x.dust, kind: x.kind }));
+  }
+  return memLogs
+    .filter((x) => new Date(x.ts) >= since)
+    .map((x) => ({ ts: x.ts, temp: x.temp, dust: x.dust, kind: x.kind }));
+}
+
+// ---------- Monthly archives ----------
+// When a month (Bangkok time) is over, its log is saved as a CSV text in the database
+// so it can be downloaded later. If the server was asleep at midnight, it catches up
+// the next time it wakes up, with the same content.
+async function monthsWithData() {
+  if (pool) {
+    await ensureDb();
+    const r = await pool.query(
+      "SELECT DISTINCT to_char(ts AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM') AS m FROM readings"
+    );
+    return r.rows.map((x) => x.m);
+  }
+  return Array.from(new Set(memLogs.map((x) => monthKey(new Date(x.ts)))));
+}
+
+async function monthRows(ym) {
+  if (pool) {
+    const r = await pool.query(
+      "SELECT ts, temp, dust, kind FROM readings " +
+        "WHERE to_char(ts AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM') = $1 ORDER BY ts ASC",
+      [ym]
+    );
+    return r.rows.map((x) => ({ ts: new Date(x.ts).toISOString(), temp: x.temp, dust: x.dust, kind: x.kind }));
+  }
+  return memLogs
+    .filter((x) => monthKey(new Date(x.ts)) === ym)
+    .map((x) => ({ ts: x.ts, temp: x.temp, dust: x.dust, kind: x.kind }));
+}
+
+async function listArchives() {
+  if (pool) {
+    await ensureDb();
+    const r = await pool.query("SELECT ym, row_count, created_at FROM archives ORDER BY ym DESC");
+    return r.rows.map((x) => ({
+      month: x.ym,
+      row_count: x.row_count,
+      created_at: new Date(x.created_at).toISOString(),
+    }));
+  }
+  return Array.from(memArchives.values())
+    .map((a) => ({ month: a.month, row_count: a.row_count, created_at: a.created_at }))
+    .sort((a, b) => (a.month < b.month ? 1 : -1));
+}
+
+async function getArchiveCsv(ym) {
+  if (pool) {
+    await ensureDb();
+    const r = await pool.query("SELECT csv FROM archives WHERE ym = $1", [ym]);
+    return r.rows.length ? r.rows[0].csv : null;
+  }
+  const a = memArchives.get(ym);
+  return a ? a.csv : null;
+}
+
+async function saveArchive(ym, count, csv) {
+  if (pool) {
+    await ensureDb();
+    await pool.query(
+      "INSERT INTO archives (ym, row_count, csv) VALUES ($1, $2, $3) ON CONFLICT (ym) DO NOTHING",
+      [ym, count, csv]
+    );
+  } else {
+    memArchives.set(ym, { month: ym, row_count: count, created_at: new Date().toISOString(), csv });
+  }
+}
+
+let archiving = false;
+async function archiveFinishedMonths() {
+  if (archiving) return;
+  archiving = true;
+  try {
+    const current = monthKey(new Date());
+    const months = (await monthsWithData()).filter((m) => m < current).sort();
+    if (!months.length) return;
+    const have = new Set((await listArchives()).map((a) => a.month));
+    for (const m of months) {
+      if (have.has(m)) continue;
+      const rows = await monthRows(m);
+      if (!rows.length) continue;
+      await saveArchive(m, rows.length, rowsToCsv(rows));
+      console.log("Archived month " + m + " (" + rows.length + " entries)");
+    }
+  } catch (e) {
+    console.error("Archive failed:", e.message);
+  } finally {
+    archiving = false;
+  }
+}
+
+// Check shortly after start, then every hour while the server is awake
+setTimeout(archiveFinishedMonths, 10000);
+setInterval(archiveFinishedMonths, 3600 * 1000);
+
+// ---------- API ----------
 // Latest reading is kept in memory (fine while the server stays awake)
 let latest = { temp: null, dust: null, receivedAt: null };
 
-// ---------- API ----------
 // ESP32 sends data here
 app.post("/api/data", (req, res) => {
   if (req.get("x-api-key") !== API_KEY) {
@@ -154,10 +308,36 @@ app.get("/api/latest", (req, res) => {
   });
 });
 
+// Force log: saves the current ESP32 reading as a "force" entry
+let lastForceAt = 0;
+app.post("/api/force-log", async (req, res) => {
+  if (FORCE_PASSWORD && req.get("x-force-password") !== FORCE_PASSWORD) {
+    return res.status(401).json({ error: "password needed" });
+  }
+  const age = latest.receivedAt ? (Date.now() - latest.receivedAt) / 1000 : null;
+  if (age === null || age >= 20) {
+    return res.status(409).json({ error: "ESP32 is offline, so there is no fresh reading to log" });
+  }
+  if (Date.now() - lastForceAt < 5000) {
+    return res.status(429).json({ error: "Wait a few seconds before logging again" });
+  }
+  lastForceAt = Date.now();
+  const temp = latest.temp;
+  const dust = latest.dust;
+  try {
+    const row = await addForceLog(temp, dust);
+    res.json({ ok: true, row });
+  } catch (e) {
+    lastForceAt = 0;
+    console.error("Force log failed:", e.message);
+    res.status(500).json({ error: "could not save to the log database" });
+  }
+});
+
 // Dashboard reads the log from here (?hours=24, 168, 720, or 0 for all)
 app.get("/api/logs", async (req, res) => {
   try {
-    const rows = await getLogs(parseHours(req.query.hours, 168));
+    const rows = await getLogs(parseHours(req.query.hours, 168), 5000);
     res.set("Cache-Control", "no-store");
     res.json({ storage: pool ? "database" : "memory", rows });
   } catch (e) {
@@ -166,17 +346,40 @@ app.get("/api/logs", async (req, res) => {
   }
 });
 
-// Download everything as CSV (opens in Excel / Google Sheets)
+// Manual download of everything as CSV (opens in Excel / Google Sheets)
 app.get("/api/logs.csv", async (req, res) => {
   try {
-    const rows = await getLogs(parseHours(req.query.hours, 0));
-    const lines = ["time_utc+7,temp_c,dust_ugm3"].concat(
-      rows.map((r) => bangkokIso(new Date(r.ts)) + "," + (r.temp === null ? "" : r.temp) + "," + (r.dust === null ? "" : r.dust))
-    );
-    res.type("text/csv").set("Content-Disposition", "attachment; filename=esp32-log.csv").send(lines.join("\n") + "\n");
+    const rows = await getLogs(parseHours(req.query.hours, 0), 100000);
+    res.type("text/csv").set("Content-Disposition", "attachment; filename=esp32-log.csv").send(rowsToCsv(rows));
   } catch (e) {
     console.error("csv failed:", e.message);
     res.status(500).send("could not read the log database");
+  }
+});
+
+// Saved monthly archives
+app.get("/api/archives", async (req, res) => {
+  try {
+    await archiveFinishedMonths();
+    const archives = await listArchives();
+    res.set("Cache-Control", "no-store");
+    res.json({ storage: pool ? "database" : "memory", archives });
+  } catch (e) {
+    console.error("archives failed:", e.message);
+    res.status(500).json({ error: "could not read the archives" });
+  }
+});
+
+app.get("/api/archives/:month", async (req, res) => {
+  const ym = String(req.params.month || "");
+  if (!/^\d{4}-\d{2}$/.test(ym)) return res.status(400).send("bad month");
+  try {
+    const csv = await getArchiveCsv(ym);
+    if (csv === null) return res.status(404).send("No archive for that month");
+    res.type("text/csv").set("Content-Disposition", "attachment; filename=esp32-log-" + ym + ".csv").send(csv);
+  } catch (e) {
+    console.error("archive download failed:", e.message);
+    res.status(500).send("could not read the archive");
   }
 });
 
@@ -290,6 +493,11 @@ const DASH = String.raw`<!DOCTYPE html>
   .btns{margin:14px 0 4px}
   .btns button{background:#1e1e1e;color:#ccc;border:1px solid #333;border-radius:20px;padding:8px 16px;margin:0 3px;font-size:14px}
   .btns button.active{background:#8ab4f8;color:#111;border-color:#8ab4f8}
+  .forcebox{margin:14px 0 4px}
+  #forceBtn{background:#f2c94c;color:#111;border:0;border-radius:20px;padding:10px 22px;font-size:15px;font-weight:600}
+  #forceBtn:disabled{opacity:.5}
+  .fmsg{font-size:14px;min-height:18px;margin-top:8px;color:#6fcf97}
+  .fmsg.bad{color:#eb5757}
   .msg{color:#eb9b5b;font-size:14px;min-height:18px;margin:8px auto;max-width:420px}
   .card{background:#1e1e1e;border-radius:16px;padding:16px;margin:14px auto;max-width:560px;text-align:left}
   .label{color:#999;font-size:14px}
@@ -298,6 +506,10 @@ const DASH = String.raw`<!DOCTYPE html>
   table{width:100%;border-collapse:collapse;font-size:14px;margin-bottom:12px}
   th{color:#999;font-weight:500;text-align:left;padding:6px 4px;border-bottom:1px solid #333}
   td{padding:6px 4px;border-bottom:1px solid #262626}
+  .badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:12px}
+  .b-auto{background:#243447;color:#8ab4f8}
+  .b-force{background:#4a3a14;color:#f2c94c}
+  .note{color:#888;font-size:13px;margin:0 0 10px}
 </style>
 </head>
 <body>
@@ -309,6 +521,10 @@ const DASH = String.raw`<!DOCTYPE html>
   <button data-r="30d" onclick="load('30d')">30 days</button>
   <button data-r="all" onclick="load('all')">All</button>
 </div>
+<div class="forcebox">
+  <button id="forceBtn" onclick="forceLog()">Log now (force)</button>
+  <div class="fmsg" id="fmsg"></div>
+</div>
 <div class="msg" id="msg"></div>
 <div class="card"><div class="label">Temperature (°C)</div>
   <div class="stat" id="tstat">--</div>
@@ -316,15 +532,20 @@ const DASH = String.raw`<!DOCTYPE html>
 <div class="card"><div class="label">Dust level (µg/m³)</div>
   <div class="stat" id="dstat">--</div>
   <div class="chartbox"><canvas id="dchart"></canvas></div></div>
-<div class="card"><div class="label" style="margin-bottom:8px">Latest log entries</div>
+<div class="card"><div class="label" style="margin-bottom:6px">Latest log entries</div>
+  <div class="note"><span class="badge b-auto">Auto</span> saved by the schedule &nbsp; <span class="badge b-force">Force</span> saved by the button (yellow dots on the charts)</div>
   <table id="tbl"></table>
   <a class="link" href="/api/logs.csv">Download all as CSV</a></div>
+<div class="card"><div class="label" style="margin-bottom:6px">Monthly archives</div>
+  <div class="note">Saved automatically when a month ends (UTC+7).</div>
+  <div id="arch">Loading...</div></div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(function(){});
 }
 var RANGES = {"24h": 24, "7d": 168, "30d": 720, "all": 0};
+var currentRange = "7d";
 var tChart = null, dChart = null;
 
 function bkk(iso) {
@@ -347,13 +568,17 @@ function fmtStat(s, d) {
   return "avg " + s.avg.toFixed(d) + " | min " + s.min.toFixed(d) + " | max " + s.max.toFixed(d);
 }
 
-function makeChart(old, id, labels, data, color) {
+function makeChart(old, id, labels, data, color, kinds) {
   if (old) old.destroy();
   if (typeof Chart === "undefined") return null;
   return new Chart(document.getElementById(id), {
     type: "line",
-    data: { labels: labels, datasets: [{ data: data, borderColor: color, backgroundColor: color,
-      tension: 0.25, pointRadius: 3, borderWidth: 2 }] },
+    data: { labels: labels, datasets: [{
+      data: data, borderColor: color, backgroundColor: color, tension: 0.25, borderWidth: 2,
+      pointRadius: function (c) { return kinds[c.dataIndex] === "force" ? 6 : 3; },
+      pointBackgroundColor: function (c) { return kinds[c.dataIndex] === "force" ? "#f2c94c" : color; },
+      pointBorderColor: function (c) { return kinds[c.dataIndex] === "force" ? "#f2c94c" : color; }
+    }] },
     options: {
       responsive: true, maintainAspectRatio: false,
       plugins: { legend: { display: false } },
@@ -365,23 +590,32 @@ function makeChart(old, id, labels, data, color) {
   });
 }
 
+function badge(kind) {
+  return kind === "force"
+    ? '<span class="badge b-force">Force</span>'
+    : '<span class="badge b-auto">Auto</span>';
+}
+
 function render(rows) {
   var labels = rows.map(function (r) { return bkk(r.ts); });
+  var kinds = rows.map(function (r) { return r.kind; });
   var temps = rows.map(function (r) { return r.temp; });
   var dusts = rows.map(function (r) { return r.dust; });
-  tChart = makeChart(tChart, "tchart", labels, temps, "#6fcf97");
-  dChart = makeChart(dChart, "dchart", labels, dusts, "#8ab4f8");
+  tChart = makeChart(tChart, "tchart", labels, temps, "#6fcf97", kinds);
+  dChart = makeChart(dChart, "dchart", labels, dusts, "#8ab4f8", kinds);
   document.getElementById("tstat").textContent = fmtStat(stats(temps), 1);
   document.getElementById("dstat").textContent = fmtStat(stats(dusts), 0);
-  var html = "<tr><th>Time (UTC+7)</th><th>Temp °C</th><th>Dust µg/m³</th></tr>";
+  var html = "<tr><th>Time (UTC+7)</th><th>Type</th><th>Temp °C</th><th>Dust µg/m³</th></tr>";
   rows.slice(-24).reverse().forEach(function (r) {
-    html += "<tr><td>" + bkk(r.ts) + "</td><td>" + (r.temp === null ? "--" : r.temp.toFixed(1)) +
-            "</td><td>" + (r.dust === null ? "--" : r.dust.toFixed(0)) + "</td></tr>";
+    html += "<tr><td>" + bkk(r.ts) + "</td><td>" + badge(r.kind) + "</td><td>" +
+            (r.temp === null ? "--" : r.temp.toFixed(1)) + "</td><td>" +
+            (r.dust === null ? "--" : r.dust.toFixed(0)) + "</td></tr>";
   });
   document.getElementById("tbl").innerHTML = html;
 }
 
 async function load(range) {
+  currentRange = range;
   document.querySelectorAll(".btns button").forEach(function (b) {
     b.className = (b.getAttribute("data-r") === range) ? "active" : "";
   });
@@ -401,7 +635,78 @@ async function load(range) {
     msg.textContent = "Could not load logs: " + e.message;
   }
 }
+
+async function loadArchives() {
+  var box = document.getElementById("arch");
+  try {
+    var r = await fetch("/api/archives", { cache: "no-store" });
+    var j = await r.json();
+    if (!r.ok) throw new Error(j.error || "server error");
+    if (!j.archives.length) {
+      box.innerHTML = '<div class="label">No archives yet. The first one is saved after the first month ends.</div>';
+      return;
+    }
+    var html = "<table><tr><th>Month</th><th>Entries</th><th></th></tr>";
+    j.archives.forEach(function (a) {
+      html += "<tr><td>" + a.month + "</td><td>" + a.row_count + '</td><td><a class="link" href="/api/archives/' +
+              a.month + '">Download CSV</a></td></tr>';
+    });
+    box.innerHTML = html + "</table>";
+  } catch (e) {
+    box.textContent = "Could not load archives: " + e.message;
+  }
+}
+
+function getPw() { try { return sessionStorage.getItem("fpw") || ""; } catch (e) { return ""; } }
+function setPw(v) { try { sessionStorage.setItem("fpw", v); } catch (e) {} }
+
+async function sendForce() {
+  var h = { "Content-Type": "application/json" };
+  var pw = getPw();
+  if (pw) h["x-force-password"] = pw;
+  var r = await fetch("/api/force-log", { method: "POST", headers: h, body: "{}" });
+  var body = {};
+  try { body = await r.json(); } catch (e) {}
+  return { status: r.status, ok: r.ok, body: body };
+}
+
+async function forceLog() {
+  var btn = document.getElementById("forceBtn");
+  var fm = document.getElementById("fmsg");
+  btn.disabled = true;
+  fm.className = "fmsg";
+  fm.textContent = "Saving...";
+  try {
+    var res = await sendForce();
+    if (res.status === 401) {
+      var p = prompt("Password for Force log:");
+      if (!p) { fm.textContent = "Cancelled."; return; }
+      setPw(p);
+      res = await sendForce();
+      if (res.status === 401) {
+        setPw("");
+        fm.className = "fmsg bad";
+        fm.textContent = "Wrong password.";
+        return;
+      }
+    }
+    if (!res.ok) {
+      fm.className = "fmsg bad";
+      fm.textContent = res.body.error || "Could not save.";
+      return;
+    }
+    fm.textContent = "Saved (Force): " + res.body.row.temp.toFixed(1) + " °C, " + res.body.row.dust.toFixed(0) + " µg/m³";
+    await load(currentRange);
+  } catch (e) {
+    fm.className = "fmsg bad";
+    fm.textContent = "Could not reach the server.";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 load("7d");
+loadArchives();
 </script>
 </body>
 </html>`;
