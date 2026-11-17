@@ -513,7 +513,7 @@ const DASH = String.raw`<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Weather report Log Dashboard</h1>
+<h1>Weather Report Log Dashboard</h1>
 <a class="link" href="/">&larr; Live view</a>
 <div class="btns">
   <button data-r="24h" onclick="load('24h')">24 h</button>
