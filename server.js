@@ -440,7 +440,7 @@ const PAGE = `<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>ESP32 Monitor</h1>
+<h1>Weather Report Monitor</h1>
 <a class="link" href="/dashboard">Log dashboard &rarr;</a>
 <div id="status" class="off">Connecting...</div>
 <div class="card"><div class="label">Temperature</div>
@@ -513,7 +513,7 @@ const DASH = String.raw`<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>ESP32 Log Dashboard</h1>
+<h1>Weather report Log Dashboard</h1>
 <a class="link" href="/">&larr; Live view</a>
 <div class="btns">
   <button data-r="24h" onclick="load('24h')">24 h</button>
