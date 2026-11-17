@@ -1,5 +1,5 @@
 {
-  "name": "esp32-monitor-server",
+  "name": "Weather Report",
   "version": "1.1.0",
   "private": true,
   "scripts": {
